@@ -1,0 +1,343 @@
+
+
+```{r}
+library(tidyverse)
+library(caret)
+
+dir = "directory/to/data/"
+
+```
+By Camilla Uhlbäck
+
+
+Read in the dataframes
+```{r}
+
+# All nouns and ratings from the original dataset
+valar <- read.table(paste0(dir,"dfs_vectors/valar.csv"), sep=",", header=T) 
+
+# word embedding files
+VH <- read.table(paste0(dir,"dfs_vectors/VH_final.csv"), sep=",", header=T)
+VL <- read.table(paste0(dir,"dfs_vectors/VL_final.csv"), sep=",", header=T)
+AH <- read.table(paste0(dir,"dfs_vectors/AH_final.csv"), sep=",", header=T)
+AL <- read.table(paste0(dir,"dfs_vectors/AL_final.csv"), sep=",", header=T)
+
+
+# image embedding files
+VH.eff <- read.table(paste0(dir,"dfs_vectors/VH_effnet.csv"), sep=",", header=T)
+VL.eff <- read.table(paste0(dir,"dfs_vectors/VL_effnet.csv"), sep=",", header=T)
+AH.eff <- read.table(paste0(dir,"dfs_vectors/AH_effnet.csv"), sep=",", header=T)
+AL.eff <- read.table(paste0(dir,"dfs_vectors/AL_effnet.csv"), sep=",", header=T)
+
+VH.res <- read.table(paste0(dir,"dfs_vectors/VH_resnet.csv"), sep=",", header=T)
+VL.res <- read.table(paste0(dir,"dfs_vectors/VL_resnet.csv"), sep=",", header=T)
+AH.res <- read.table(paste0(dir,"dfs_vectors/AH_resnet.csv"), sep=",", header=T)
+AL.res <- read.table(paste0(dir,"dfs_vectors/AL_resnet.csv"), sep=",", header=T)
+
+```
+
+
+Testing correlation between valence and arousal, 
+starting with normality test to proceed to the correct cor.test
+```{r}
+# correlation test for valence and arousal
+
+shapiro.test(AH$A.Mean.Sum) # test is significant: the distribution is non-normal
+shapiro.test(AL$A.Mean.Sum) # non-normal
+shapiro.test(VH$V.Mean.Sum) # non-normal
+shapiro.test(VL$V.Mean.Sum) # non-normal
+
+```
+
+Distribution was non-normal, using Spearman's correlation coefficient
+```{r}
+# spearman's is the nonparametric correlation test
+
+cor.test(VH$V.Mean.Sum, VH$A.Mean.Sum, method = "spearman")   # high valence  
+# a low rho (0.26)
+cor.test(VL$V.Mean.Sum, VL$A.Mean.Sum, method = "spearman")   # low valence
+# low rho (-0.26)
+cor.test(AH$V.Mean.Sum, AH$A.Mean.Sum, method = "spearman")   # high arousal
+# even worse rho (-0.1)
+cor.test(AL$V.Mean.Sum, AL$A.Mean.Sum, method = "spearman")   # low arousal
+# the worst rho (-0.08)
+
+# very low or no correlation between the variables valence and arousal
+```
+
+
+**1. Normalisation function**
+
+
+```{r}
+
+normalise_embedding <- function(df, starts_w){      # function for normalisation
+  embedding_lengths <- df %>%
+    select(Word, starts_with(!!starts_w)) %>%
+    pivot_longer(!Word) %>%
+    group_by(Word) %>% 
+    mutate(val_2 = value^2) %>%
+    summarise(len = abs(sqrt(sum(val_2))))
+    
+  df %>%
+    select(Word, starts_with(!!starts_w)) %>%
+    pivot_longer(!Word) %>%
+    group_by(Word) %>%
+    left_join(embedding_lengths, by = "Word") %>%
+    mutate(norm_value = value / len) %>%
+    select(Word, name, norm_value) %>%
+    pivot_wider(names_from = name, values_from = norm_value) %>% 
+    ungroup() %>%
+    return()
+}
+
+check_normalised <- function(df, starts_w){    # test if length equals 1
+  embedding_lengths <- df %>%
+    select(Word, starts_with(!!starts_w)) %>%
+    pivot_longer(!Word) %>%
+    group_by(Word) %>% 
+    mutate(val_2 = value^2) %>%
+    summarise(len = abs(sqrt(sum(val_2))))
+  return(all(near(embedding_lengths$len,1)))
+}
+
+```
+
+**2. K-fold results function**
+
+Home made RMSE, R2, MAE, rho; 
+showing the correlation of the predicted values to the human ratings
+
+```{r}
+
+# function for correlation data
+k_fold_stats <- function(model){           # takes the trained regression model
+  per_fold_stats <- model$pred %>%         # correlation stats per fold
+    mutate(residuals = obs - pred) %>%
+    group_by(Resample) %>% 
+    summarise(RMSE = sqrt(mean(residuals^2)),
+              R2 = cor(obs, pred)^2,
+              MEA = mean(abs(residuals)),
+              rho = cor.test(x = obs, y = pred, method = 'spearman')$estimate,
+              rho_p = cor.test(x = obs, y = pred, method = 'spearman')$p.value)
+  
+  # list(per_fold = per_fold_stats, 
+  #      summary = per_fold_stats %>% 
+  #        summarise(#RMSE_mean = mean(RMSE), RMSE_sd = sd(RMSE),
+  #           #R2_mean = mean(R2), R2_sd = sd(R2),
+  #           #MEA_mean = mean(MEA), MEA_sd = sd(MEA),
+  #           rho_mean = mean(rho), rho_sd = sd(rho),
+  #           rho_max = max(rho), rho_min = min(rho))
+  #      )
+  per_fold_stats %>%
+    summarise(rho_mean = mean(rho), rho_sd = sd(rho),
+              rho_max = max(rho), rho_min = min(rho))
+}
+```
+
+
+**3. Regression Analysis**
+
+Splitting the data into different combination dataframes for the regression analyses.
+Models for valence and arousal are kept separate (all models for both val and aro).
+Training the models with linear and lasso regression (both tested for all models).
+Models: word embeddings - Google and ftext, 
+        image embeddings - Resnet and Effnet (both named 'vec' in original dfs, therefore renamed to 'vec_name1', 'vec_name2'),
+        multimodal embeddings - all combinations (G+Resnet, G+Effnet, F+Resnet, F+Effnet)
+```{r}
+
+
+models <- list(
+  "aro" = list(                    # variables for different arousal models
+  "text" = c("AH", "AL"),
+  "eff" = c("AH.eff", "AL.eff"),
+  "res" = c("AH.res", "AL.res")
+  ),
+  "val" = list(                    # variables for different valence models
+    "text" = c("VH","VL"),
+    "eff" = c("VH.eff","VL.eff"),
+    "res" = c("VH.res","VL.res")
+  )
+)
+
+rating_types <- c("val" = "V.Mean.Sum", "aro" = "A.Mean.Sum")     # valence ratings from column 'V.Mean.Sum', arousal from 'A.Mean.Sum'
+
+model_combs = expand.grid(c("glmnet", "lm"), c("val","aro"), c("","google", "ftext"), c("", "eff", "res")) %>%   # automatically create all combinations of elements (unimodal models only take one type embdding, therefore empty added)
+  filter(! (Var3 == "" & Var4 == "")) %>%                      # remove case of no word and no image vector 
+  mutate_each(as.character) %>%                                # correct type
+  rowwise() %>% 
+  group_map(~list(model = .$Var1, rating_type = .$Var2, text_vec = .$Var3, image_vec = .$Var4)) # seperates dataframe into list with element for each row, and sublists with element for each column
+
+get_data_by_name <- function(rating_type, vec_type){
+  if(vec_type == "") return()
+  if(vec_type %in% c("google", "ftext")){           # if text model chosen
+    df_names <- models[[rating_type]][["text"]]     # from var 'text'   
+    map_dfr(df_names, ~get(.) %>% 
+            select(Word, rating_types[rating_type], starts_with(vec_type))  # get word embeddings 
+            ) %>%
+      return()
+  } else {
+    df_names <- models[[rating_type]][[vec_type]]
+    map_dfr(df_names, ~get(.) %>%
+            select(Word, rating_types[rating_type], starts_with("vec")) # otherwise get image embeddings
+            ) %>%
+      return()
+  }
+}
+
+# Test:
+# walk(model_combs, function(combs){
+#   print(combs)
+#   map_dbl(c(combs$text_vec, combs$text_vec), 
+#           ~get_data_by_name($rating_type, .) %>% nrow() %>% ifelse(is.null(.), 0, .) 
+#           ) %>%
+#     print()
+# })
+
+combine_models <- function(case){
+  rating_type <- case$rating_type
+  vec_name1 <- case$text_vec                                                  # source of the embedding (e.g. google, res, etc.)
+  vec_name2 <- case$image_vec
+  col_name1 <- ifelse(vec_name1 %in% c("google", "ftext"), vec_name1, "vec")  # name of the column containing the embedding vector
+  col_name2 <- ifelse(vec_name2 %in% c("google", "ftext"), vec_name2, "vec")
+  
+  if("" %in% c(vec_name1, vec_name2)){                                        # unimodal case
+    c(vec_name1, vec_name2)[which(c(vec_name1, vec_name2) != "")] %>% 
+      get_data_by_name(rating_type, .) %>%
+      (function(df)
+        normalise_embedding(df, starts_w = c(col_name1, col_name2)[which(c(vec_name1, vec_name2) != "")]) %>%   # normalise either word or image embedding depending of the model
+          left_join(select(df, Word, !!rating_type), by = "Word")
+      ) %>%
+      return()
+  } else {                                                                    # multimodal case
+    get_data_by_name(rating_type, vec_name1) %>%
+      (function(df)
+        normalise_embedding(df, starts_w = col_name1) %>%          # normalise the word embedding
+          left_join(select(df, Word, !!rating_type), by = "Word")
+      ) %>%
+      (function(df)
+        get_data_by_name(rating_type, vec_name2) %>%               # normalise the image embedding
+          normalise_embedding(., starts_w = col_name2) %>%
+          left_join(df, by = "Word")
+      ) %>%
+      return()
+  }
+}
+
+# Test:
+# map(model_combs, ~combine_models(.) %>% (function(df) c(nrow(df), ncol(df))))
+
+
+# training the regression models
+train_model <- function(case, data){
+  reg_type = case$model
+  rating_type = case$rating_type
+  set.seed(125)
+  train.control <- trainControl(method = "cv", number = 10, savePredictions = "all")  #10-fold cross-validation
+  if(reg_type == "glmnet"){                    # lasso regression
+    train(as.formula(paste(rating_type,"~ .")), 
+          data = data, 
+          method = "glmnet",
+          trControl = train.control,
+          tuneGrid = expand.grid(alpha = 1, lambda = seq(0.001, 0.1, by = 0.0002))) %>%
+      return()
+  } else {                                    # linear regression
+    train(as.formula(paste(rating_type,"~ .")), 
+          data = data, 
+          method = "lm",
+          trControl = train.control) %>% 
+      return()
+  }
+}
+
+# Test:
+# model_combs[[2]] %>% (function(case){
+#   combine_models(case) %>% 
+#     select(-Word) %>%
+#     train_model(case = case, data = .) %>% 
+#     k_fold_stats() %>%                         # get k-fold results
+#     mutate(model = case$model, rating = case$rating_type, 
+#            text_vec = case$text_vec, image_vec = case$image_vec)
+#   })
+
+all_model_stats <- map_dfr(model_combs, function(case){
+  combine_models(case) %>%
+    select(-Word) %>%
+    train_model(case = case, data = .) %>%
+    k_fold_stats() %>%
+    mutate(model = case$model, rating = case$rating_type,
+           text_vec = case$text_vec, image_vec = case$image_vec)
+        })
+
+all_model_stats %>% write_csv("./all_model_stats.csv")  # save results
+
+```
+
+**4. Additional test**
+
+Look at words, their original ratings, the predicted ratings and their residuals in the best multimodal model (Google+Resnet, using lasso)
+```{r}
+
+good_models <- 
+  map(list(
+    list(model = "glmnet", rating_type = "val", text_vec = "google", image_vec = "res"),  # for valence
+    list(model = "glmnet", rating_type = "aro", text_vec = "google", image_vec = "res")   # for arousal
+    ),
+     (function(case){
+       combine_models(case) %>% 
+         select(-Word) %>%
+         train_model(case = case, data = .)# %>% 
+         # k_fold_stats() %>%
+         # mutate(model = case$model, rating = case$rating_type, 
+         #       text_vec = case$text_vec, image_vec = case$image_vec)
+    })
+  )
+
+
+multimodal_data <- 
+  map(list(
+    list(model = "glmnet", rating_type = "val", text_vec = "google", image_vec = "res"),
+    list(model = "glmnet", rating_type = "aro", text_vec = "google", image_vec = "res")
+    ), combine_models
+  )
+
+good_models[[1]] %>% class() 
+
+multimodal_data[[2]] %>%  # table from arousal model
+  (function(df)
+    df %>% select(Word, aro) %>% 
+    bind_cols("pred" = predict(good_models[[2]], type = "raw",
+                               newdata = df))
+  ) %>% 
+  mutate(delta = abs(aro - pred)) %>%   # the residuals
+  left_join(valar %>% select(Word, aro = A.Mean.Sum, val = V.Mean.Sum)) %>%   # get both ratings
+  arrange(desc(delta)) %>%
+  head(10) %>% 
+  transmute(Word, val, aro, predicted_aro = round(pred,2), residual = round(delta,2)) %>%  # columns from word, both ratings, the predicted arousal rating, residual
+  write_delim("worst_aro.txt", delim = " amp ", quote = "none", eol = " \\\\\n")
+
+multimodal_data[[1]] %>%   # table from valence model
+  (function(df)
+    df %>% select(Word, val) %>% 
+    bind_cols("pred" = predict(good_models[[1]], type = "raw",
+                               newdata = df))
+  ) %>% 
+  mutate(delta = abs(val - pred)) %>% 
+  left_join(valar %>% select(Word, aro = A.Mean.Sum, val = V.Mean.Sum)) %>%
+  arrange(desc(delta)) %>%
+  head(10) %>% 
+  transmute(Word, val, aro, predicted_val = round(pred,2), residual = round(delta,2)) %>% 
+  write_delim("worst_val.txt", delim = " amp ", quote = "none", eol = " \\\\\n")
+  
+
+
+```
+
+
+
+
+
+
+
+
+
